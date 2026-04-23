@@ -381,6 +381,74 @@ void FrankaApi::setLoad(double load_mass,
     robot->setLoad(load_mass, F_x_Cload, load_inertia);
 }
 
+bool FrankaApi::robot_control_j7_pinned(
+    cartesian_velocities_controller_callback cv_handle,
+    double q7_target,
+    double j7_gain,
+    double dq_max,
+    bool   limit_rate,
+    double cutoff_frequency)
+{
+    const double lam = 0.02;  // DLS damping — small enough for good velocity tracking, large enough for singularity safety
+
+    franka::Model model = robot->loadModel();
+
+    try {
+        robot->control([&](const franka::RobotState& rs, franka::Duration period) -> franka::JointVelocities {
+            // Ask Python callback for desired Cartesian velocity
+            franka::CartesianVelocities cv = cv_handle(rs, period);
+
+            if (cv.motion_finished) {
+                return franka::MotionFinished(franka::JointVelocities({0,0,0,0,0,0,0}));
+            }
+
+            // Zero Jacobian: 6×7, column-major, 42 doubles
+            std::array<double, 42> J_flat = model.zeroJacobian(franka::Frame::kEndEffector, rs);
+            Eigen::Map<Eigen::Matrix<double, 6, 7>> J(J_flat.data());
+
+            // Desired Cartesian velocity
+            Eigen::Matrix<double, 6, 1> v;
+            for (int i = 0; i < 6; i++) v(i) = cv.O_dP_EE[i];
+
+            // DLS pseudoinverse: J^T (J J^T + lam I)^{-1}
+            Eigen::Matrix<double, 7, 6> J_pinv =
+                J.transpose() * (J * J.transpose() +
+                                  lam * Eigen::Matrix<double, 6, 6>::Identity()).inverse();
+
+            // Primary task: follow Cartesian velocity
+            Eigen::Matrix<double, 7, 1> dq = J_pinv * v;
+
+            // Null-space: drive j7 toward q7_target
+            double j7_err = q7_target - rs.q[6];
+            if (std::abs(j7_err) > 0.003) {
+                Eigen::Matrix<double, 7, 7> N =
+                    Eigen::Matrix<double, 7, 7>::Identity() - J_pinv * J;
+                Eigen::Matrix<double, 7, 1> v_null = Eigen::Matrix<double, 7, 1>::Zero();
+                v_null(6) = j7_gain * j7_err;
+                dq += N * v_null;
+            }
+
+            // Hard velocity limit
+            for (int i = 0; i < 7; i++)
+                dq(i) = std::max(-dq_max, std::min(dq_max, dq(i)));
+
+            return franka::JointVelocities(
+                {dq(0), dq(1), dq(2), dq(3), dq(4), dq(5), dq(6)});
+
+        }, franka::ControllerMode::kJointImpedance, limit_rate, cutoff_frequency);
+
+        cout << "Finished motion." << std::endl;
+        return true;
+    }
+    catch (const franka::ControlException& e) {
+        std::cout << e.what() << std::endl;
+        writeLogToFile(e.log);
+        std::cout << "Running error recovery..." << std::endl;
+        robot->automaticErrorRecovery();
+        return false;
+    }
+}
+
 void FrankaApi::test(const string &ip)
 {
     cout << "ip:" << ip << endl;

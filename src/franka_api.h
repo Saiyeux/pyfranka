@@ -64,6 +64,16 @@ public:
     bool robot_control(cartesian_velocities_controller_callback cartesian_velocities_handle, franka::ControllerMode controller_mode = franka::ControllerMode::kJointImpedance,
                        bool limit_rate = true, double cutoff_frequency = franka::kDefaultCutoffFrequency);
 
+    // Cartesian velocity callback → joint velocity control with j7 null-space pinning.
+    // Uses libfranka model Jacobian (accurate, runs fully in C++, no Python overhead).
+    bool robot_control_j7_pinned(
+        cartesian_velocities_controller_callback cv_handle,
+        double q7_target,
+        double j7_gain = 1.5,
+        double dq_max  = 0.3,
+        bool   limit_rate = true,
+        double cutoff_frequency = franka::kDefaultCutoffFrequency);
+
     bool read_robot_state(read_robot_state_callback read_robot_state_handle);
 
     void set_collision_behavior(const std::array<double, 7>& lower_torque_thresholds_acceleration,

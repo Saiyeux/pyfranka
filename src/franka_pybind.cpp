@@ -108,6 +108,15 @@ PYBIND11_MODULE(franka_pybind, m) {
             .def("readOnce", &FrankaApi::readOnce)
             .def("stop", &FrankaApi::stop)
 
+            .def("robot_control_j7_pinned",
+                 &FrankaApi::robot_control_j7_pinned,
+                 py::arg("cartesian_velocities_handle"),
+                 py::arg("q7_target"),
+                 py::arg("j7_gain") = 1.5,
+                 py::arg("dq_max")  = 0.3,
+                 py::arg("limit_rate") = true,
+                 py::arg("cutoff_frequency") = franka::kDefaultCutoffFrequency)
+
             .def("test", &FrankaApi::test, py::arg("ip") = "localhost")
 
             ;
