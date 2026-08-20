@@ -64,6 +64,16 @@ public:
     bool robot_control(cartesian_velocities_controller_callback cartesian_velocities_handle, franka::ControllerMode controller_mode = franka::ControllerMode::kJointImpedance,
                        bool limit_rate = true, double cutoff_frequency = franka::kDefaultCutoffFrequency);
 
+    // Cartesian velocity callback -> joint velocity control with start-posture
+    // null-space hold.  This is for non-paint transit/contact/lift moves where
+    // J7 is not pinned, but the elbow must not drift into another branch.
+    bool robot_control_cartesian_velocities_posture(
+        cartesian_velocities_controller_callback cv_handle,
+        double posture_gain = 1.0,
+        double dq_max = 0.3,
+        bool limit_rate = true,
+        double cutoff_frequency = franka::kDefaultCutoffFrequency);
+
     // Cartesian velocity callback → joint velocity control with j7 null-space pinning.
     // Uses libfranka model Jacobian (accurate, runs fully in C++, no Python overhead).
     bool robot_control_j7_pinned(
@@ -125,5 +135,4 @@ private:
 //    franka::Robot *robot;
 
 };
-
 

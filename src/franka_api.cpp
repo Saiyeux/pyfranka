@@ -1,5 +1,6 @@
 
 #include "franka_api.h"
+#include "j7_pinned_solver.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -301,6 +302,107 @@ bool FrankaApi::robot_control(cartesian_velocities_controller_callback cartesian
     return true;
 }
 
+bool FrankaApi::robot_control_cartesian_velocities_posture(
+    cartesian_velocities_controller_callback cv_handle,
+    double posture_gain,
+    double dq_max,
+    bool limit_rate,
+    double cutoff_frequency)
+{
+    const double lam = 0.02;
+    const double joint_limit_margin = 0.10;
+
+    franka::Model model = robot->loadModel();
+    Eigen::Matrix<double, 7, 1> q_reference = Eigen::Matrix<double, 7, 1>::Zero();
+    bool have_reference = false;
+    bool stopped_on_joint_limit = false;
+    int stopped_joint = -1;
+    double stopped_margin = 0.0;
+
+    try {
+        robot->control([&](const franka::RobotState& rs, franka::Duration period) -> franka::JointVelocities {
+            int limit_joint = -1;
+            const double limit_margin = j7_pinned::min_joint_margin(rs.q, &limit_joint);
+            if (limit_margin < joint_limit_margin) {
+                stopped_on_joint_limit = true;
+                stopped_joint = limit_joint;
+                stopped_margin = limit_margin;
+                return franka::MotionFinished(franka::JointVelocities({0,0,0,0,0,0,0}));
+            }
+
+            Eigen::Matrix<double, 7, 1> q;
+            for (int i = 0; i < 7; i++) q(i) = rs.q[i];
+            if (!have_reference) {
+                q_reference = q;
+                have_reference = true;
+            }
+
+            franka::CartesianVelocities cv = cv_handle(rs, period);
+            if (cv.motion_finished) {
+                return franka::MotionFinished(franka::JointVelocities({0,0,0,0,0,0,0}));
+            }
+
+            std::array<double, 42> J_flat = model.zeroJacobian(franka::Frame::kEndEffector, rs);
+            Eigen::Map<Eigen::Matrix<double, 6, 7>> J(J_flat.data());
+
+            Eigen::Matrix<double, 6, 1> v;
+            for (int i = 0; i < 6; i++) v(i) = cv.O_dP_EE[i];
+
+            // Transit/contact/lift must keep the brush axis safe, but yaw
+            // around the brush axis is irrelevant.  Track XYZ + two tilt axes;
+            // any posture hold remains optional and is passed in by Python.
+            Eigen::Map<const Eigen::Matrix<double, 4, 4>> O_T_EE(rs.O_T_EE.data());
+            const Eigen::Vector3d tool_axis =
+                j7_pinned::normalized_or_z(O_T_EE.block<3, 1>(0, 2));
+            Eigen::Vector3d u;
+            Eigen::Vector3d w;
+            j7_pinned::perpendicular_basis(tool_axis, &u, &w);
+
+            Eigen::Matrix<double, 5, 7> M = Eigen::Matrix<double, 5, 7>::Zero();
+            M.block<3, 7>(0, 0) = J.block<3, 7>(0, 0);
+            M.row(3) = u.transpose() * J.block<3, 7>(3, 0);
+            M.row(4) = w.transpose() * J.block<3, 7>(3, 0);
+
+            Eigen::Matrix<double, 5, 1> b = Eigen::Matrix<double, 5, 1>::Zero();
+            b.head<3>() = v.head<3>();
+            b(3) = u.dot(v.tail<3>());
+            b(4) = w.dot(v.tail<3>());
+
+            Eigen::Matrix<double, 7, 5> M_pinv =
+                M.transpose() *
+                (M * M.transpose() + lam * lam * Eigen::Matrix<double, 5, 5>::Identity()).inverse();
+
+            Eigen::Matrix<double, 7, 1> dq = M_pinv * b;
+            const Eigen::Matrix<double, 7, 7> N =
+                Eigen::Matrix<double, 7, 7>::Identity() - M_pinv * M;
+            dq += N * (posture_gain * (q_reference - q));
+
+            for (int i = 0; i < 7; i++)
+                dq(i) = std::max(-dq_max, std::min(dq_max, dq(i)));
+
+            return franka::JointVelocities(
+                {dq(0), dq(1), dq(2), dq(3), dq(4), dq(5), dq(6)});
+
+        }, franka::ControllerMode::kJointImpedance, limit_rate, cutoff_frequency);
+
+        cout << "Finished motion." << std::endl;
+        if (stopped_on_joint_limit) {
+            std::cout << "Posture-stable Cartesian motion stopped near joint limit: J"
+                      << (stopped_joint + 1)
+                      << " margin=" << stopped_margin << " rad" << std::endl;
+            return false;
+        }
+        return true;
+    }
+    catch (const franka::ControlException& e) {
+        std::cout << e.what() << std::endl;
+        writeLogToFile(e.log);
+        std::cout << "Running error recovery..." << std::endl;
+        robot->automaticErrorRecovery();
+        return false;
+    }
+}
+
 bool FrankaApi::read_robot_state(read_robot_state_callback read_robot_state_handle)
 {
     try {
@@ -389,12 +491,36 @@ bool FrankaApi::robot_control_j7_pinned(
     bool   limit_rate,
     double cutoff_frequency)
 {
-    const double lam = 0.02;  // DLS damping — small enough for good velocity tracking, large enough for singularity safety
+    const double lam = 0.02;  // DLS damping: velocity tracking with singularity safety.
+    const double posture_gain = 0.3;
+    const double joint_limit_margin = 0.10;
 
     franka::Model model = robot->loadModel();
+    Eigen::Matrix<double, 7, 1> q_reference = Eigen::Matrix<double, 7, 1>::Zero();
+    bool have_reference = false;
+    bool stopped_on_joint_limit = false;
+    int stopped_joint = -1;
+    double stopped_margin = 0.0;
 
     try {
         robot->control([&](const franka::RobotState& rs, franka::Duration period) -> franka::JointVelocities {
+            int limit_joint = -1;
+            const double limit_margin = j7_pinned::min_joint_margin(rs.q, &limit_joint);
+            if (limit_margin < joint_limit_margin) {
+                stopped_on_joint_limit = true;
+                stopped_joint = limit_joint;
+                stopped_margin = limit_margin;
+                return franka::MotionFinished(franka::JointVelocities({0,0,0,0,0,0,0}));
+            }
+
+            Eigen::Matrix<double, 7, 1> q;
+            for (int i = 0; i < 7; i++) q(i) = rs.q[i];
+            if (!have_reference) {
+                q_reference = q;
+                q_reference(6) = q7_target;
+                have_reference = true;
+            }
+
             // Ask Python callback for desired Cartesian velocity
             franka::CartesianVelocities cv = cv_handle(rs, period);
 
@@ -410,23 +536,14 @@ bool FrankaApi::robot_control_j7_pinned(
             Eigen::Matrix<double, 6, 1> v;
             for (int i = 0; i < 6; i++) v(i) = cv.O_dP_EE[i];
 
-            // DLS pseudoinverse: J^T (J J^T + lam I)^{-1}
-            Eigen::Matrix<double, 7, 6> J_pinv =
-                J.transpose() * (J * J.transpose() +
-                                  lam * Eigen::Matrix<double, 6, 6>::Identity()).inverse();
-
-            // Primary task: follow Cartesian velocity
-            Eigen::Matrix<double, 7, 1> dq = J_pinv * v;
-
-            // Null-space: drive j7 toward q7_target
-            double j7_err = q7_target - rs.q[6];
-            if (std::abs(j7_err) > 0.003) {
-                Eigen::Matrix<double, 7, 7> N =
-                    Eigen::Matrix<double, 7, 7>::Identity() - J_pinv * J;
-                Eigen::Matrix<double, 7, 1> v_null = Eigen::Matrix<double, 7, 1>::Zero();
-                v_null(6) = j7_gain * j7_err;
-                dq += N * v_null;
-            }
+            // Painting with a round brush does not need yaw about the brush axis.
+            // Track XYZ + tool-axis tilt + J7, then use the remaining null-space
+            // to stay near the stroke-start posture.
+            Eigen::Map<const Eigen::Matrix<double, 4, 4>> O_T_EE(rs.O_T_EE.data());
+            const Eigen::Vector3d tool_axis = O_T_EE.block<3, 1>(0, 2);
+            Eigen::Matrix<double, 7, 1> dq = j7_pinned::solve_velocity(
+                J, v, tool_axis, q, q_reference, q7_target, j7_gain,
+                posture_gain, lam);
 
             // Hard velocity limit
             for (int i = 0; i < 7; i++)
@@ -438,6 +555,12 @@ bool FrankaApi::robot_control_j7_pinned(
         }, franka::ControllerMode::kJointImpedance, limit_rate, cutoff_frequency);
 
         cout << "Finished motion." << std::endl;
+        if (stopped_on_joint_limit) {
+            std::cout << "J7-pinned motion stopped near joint limit: J"
+                      << (stopped_joint + 1)
+                      << " margin=" << stopped_margin << " rad" << std::endl;
+            return false;
+        }
         return true;
     }
     catch (const franka::ControlException& e) {
@@ -453,4 +576,3 @@ void FrankaApi::test(const string &ip)
 {
     cout << "ip:" << ip << endl;
 }
-

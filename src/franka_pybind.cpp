@@ -117,6 +117,14 @@ PYBIND11_MODULE(franka_pybind, m) {
                  py::arg("limit_rate") = true,
                  py::arg("cutoff_frequency") = franka::kDefaultCutoffFrequency)
 
+            .def("robot_control_cartesian_velocities_posture",
+                 &FrankaApi::robot_control_cartesian_velocities_posture,
+                 py::arg("cartesian_velocities_handle"),
+                 py::arg("posture_gain") = 1.0,
+                 py::arg("dq_max") = 0.3,
+                 py::arg("limit_rate") = true,
+                 py::arg("cutoff_frequency") = franka::kDefaultCutoffFrequency)
+
             .def("test", &FrankaApi::test, py::arg("ip") = "localhost")
 
             ;
@@ -404,7 +412,6 @@ PYBIND11_MODULE(franka_pybind, m) {
 //    m.def("test_path", &test_path);
 
 }
-
 
 
 
