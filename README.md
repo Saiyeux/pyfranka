@@ -9,28 +9,41 @@ Exposes the full `franka::Robot` control interface to Python, including real-tim
 - RT Linux (real-time kernel) on the control PC
 - libfranka (tested with the version matching your robot's firmware)
 - Eigen3
-- Python 3.8
-- CMake ≥ 3.10
+- Python with development headers, compatible with the selected pybind11
+- Installed pybind11 (2.13.6 is suitable for Python 3.11)
+- CMake ≥ 3.18 and a C++17 compiler
 
 ## Build
 
 ```bash
 git clone <this repo>
 cd pyfranka
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
-cd ..
-pip install -e .
+python -m pip install pybind11
+cmake -S . -B build -DPython_EXECUTABLE="$(command -v python)" -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel 2
+python -m pip install -e .
 ```
 
 CMake will look for libfranka via `find_package(Franka)`. If libfranka is installed to a non-standard path, set `CMAKE_PREFIX_PATH` before building:
 
 ```bash
-cmake .. -DCMAKE_PREFIX_PATH=/path/to/libfranka/install
+cmake -S . -B build -DCMAKE_PREFIX_PATH=/path/to/libfranka/install
 ```
 
-The compiled extension (`franka_pybind.cpython-38-x86_64-linux-gnu.so`) is placed in `pyfranka/` automatically.
+Alternatively, pass `-DFranka_DIR=/directory/containing/FrankaConfig.cmake`
+to use an existing libfranka build. No machine path or Python/libfranka version
+is hardcoded in CMake. The libfranka version must match the robot firmware.
+
+Installed pybind11 is discovered through `pybind11_DIR`, `CMAKE_PREFIX_PATH`,
+or the selected Python's `python -m pybind11 --cmakedir`. To use the vendored
+copy explicitly, pass `-DPYFRANKA_USE_BUNDLED_PYBIND11=ON`. The current vendored
+2.6.1 does not support Python 3.11 and may need CMake policy compatibility settings.
+
+Use a separate build directory when switching Python environments to avoid
+cached interpreter/library paths. The extension is placed in `pyfranka/` with
+the selected Python ABI suffix. `PYFRANKA_OUTPUT_DIRECTORY` can override the
+output location; the editable install expects the default. Build commands do
+not connect to the robot.
 
 ## Quick Start
 
